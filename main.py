@@ -1,179 +1,139 @@
+import numpy as np
+from pathlib import Path
 import os
-import shutil
-import tempfile
-from joblib import Parallel, delayed
-import nibabel as nib
-from lib.zscore_norm import zscore_normalize
-from nipype.interfaces import fsl
-from nipype.interfaces.ants import N4BiasFieldCorrection, ApplyTransforms, Registration
-import subprocess
+import time
+import datetime
+import SimpleITK as sitk
+from typing import List
+from get_config import get_config_dict
+from PIL import Image
 
 
-def preprocess(data_dir, subject, atlas_dir, output_dir):
-    with tempfile.TemporaryDirectory() as temp_dir:
-        if not os.path.exists(os.path.join(output_dir, subject, 'ceT1_r.nii.gz')):
-            if os.path.exists(os.path.join(data_dir, 'crossmoda_', subject, '_ceT1.nii.gz')):
-                # reorient to MNI standard direction
-                reorient = fsl.utils.Reorient2Std()
-                reorient.inputs.in_file = os.path.join(data_dir, 'crossmoda_', subject, '_ceT1.nii.gz')
-                reorient.inputs.out_file = os.path.join(temp_dir, 'ceT1_reorient.nii.gz')
-                reorient.run()
+def get_unique_image_file(subject_protocol_folder: List[Path]) -> np.array:
+    # the inversion [::-1] is done so the most preprocessed data is used
+    found_image_ids = np.array([image_file.parents[0].name for image_file in subject_protocol_folder])
+    inverse_found_image_ids = found_image_ids[::-1]
+    ids, idx = np.unique(inverse_found_image_ids, return_index=True)
+    unique_image_ids_paths = np.array(subject_protocol_folder)[::-1][idx]
 
-                # robust fov to remove neck and lower head automatically
-                rf = fsl.utils.RobustFOV()
-                rf.inputs.in_file = os.path.join(temp_dir, 'ceT1_reorient.nii.gz')
-                rf.inputs.out_roi = os.path.join(temp_dir, 'ceT1_RF.nii.gz')
-                rf.run()
+    assert len(unique_image_ids_paths) <= len(subject_protocol_folder)
+    assert len(unique_image_ids_paths) > 0
 
-                # skull stripping first run
-                print('BET pre-stripping...')
-                btr1 = fsl.BET()
-                btr1.inputs.in_file = os.path.join(temp_dir, 'ceT1_RF.nii.gz')
-                btr1.inputs.robust = True
-                btr1.inputs.frac = 0.2
-                btr1.inputs.out_file = os.path.join(temp_dir, 'ceT1_RF.nii.gz')
-                btr1.run()
+    return unique_image_ids_paths
 
-                # N4 bias field correction
-                print('N4 Bias Field Correction running...')
-                input_image = os.path.join(temp_dir, 'ceT1_RF.nii.gz')
-                output_image = os.path.join(temp_dir, 'ceT1_RF.nii.gz')
-                subprocess.call('N4BiasFieldCorrection --bspline-fitting [ 300 ] -d 3 '
-                                '--input-image %s --convergence [ 50x50x30x20 ] --output %s --shrink-factor 3'
-                                % (input_image, output_image), shell=True)
 
-                # registration of FLAIR to MNI152 FLAIR template
-                print('ANTs registration...')
-                reg = Registration()
-                reg.inputs.fixed_image = atlas_dir + '/flair_test.nii.gz'
-                reg.inputs.moving_image = os.path.join(temp_dir, 'ceT1_RF.nii.gz')
-                reg.inputs.output_transform_prefix = os.path.join(output_dir, subject, 'ceT1_r_transform.mat')
-                reg.inputs.winsorize_upper_quantile = 0.995
-                reg.inputs.winsorize_lower_quantile = 0.005
-                reg.inputs.transforms = ['Rigid', 'Affine', 'SyN']
-                reg.inputs.transform_parameters = [(0.1,), (0.1,), (0.1, 3.0, 0.0)]
-                reg.inputs.number_of_iterations = [[1000, 500, 250, 100], [1000, 500, 250, 100], [100, 70, 50, 20]]
-                reg.inputs.dimension = 3
-                reg.inputs.initial_moving_transform_com = 0
-                reg.inputs.write_composite_transform = True
-                reg.inputs.collapse_output_transforms = False
-                reg.inputs.initialize_transforms_per_stage = False
-                reg.inputs.metric = ['Mattes', 'Mattes', ['Mattes', 'CC']]
-                reg.inputs.metric_weight = [1, 1, [.5, .5]]  # Default (value ignored currently by ANTs)
-                reg.inputs.radius_or_number_of_bins = [32, 32, [32, 4]]
-                reg.inputs.sampling_strategy = ['Random', 'Random', None]
-                reg.inputs.sampling_percentage = [0.25, 0.25, [0.05, 0.10]]
-                reg.inputs.convergence_threshold = [1e-6, 1.e-6, 1.e-6]
-                reg.inputs.convergence_window_size = [10] * 3
-                reg.inputs.smoothing_sigmas = [[3, 2, 1, 0], [3, 2, 1, 0], [3, 2, 1, 0]]
-                reg.inputs.sigma_units = ['vox'] * 3
-                reg.inputs.shrink_factors = [[8, 4, 2, 1], [8, 4, 2, 1], [8, 4, 2, 1]]
-                reg.inputs.use_estimate_learning_rate_once = [True, True, True]
-                reg.inputs.use_histogram_matching = [True, True, True]  # This is the default
-                reg.inputs.output_warped_image = os.path.join(output_dir, subject, 'ANTS_T1_r.nii.gz')
-                reg.inputs.verbose = True
-                reg.run()
+def intensity_normalization(volume: np.array, clip_ratio: float = 99.5):
+    # Normalize the pixel values of volumes to (-1, 1)
+    assert np.min(volume) == 0.0
+    volume_max = np.percentile(volume, clip_ratio)
+    volume = np.clip(volume / volume_max, 0, 1) * 2 - 1
 
-                # second pass of BET skull stripping
-                print('BET skull stripping...')
-                btr2 = fsl.BET()
-                btr2.inputs.in_file = os.path.join(output_dir, subject, 'ANTS_T1_r.nii.gz')
-                btr2.inputs.robust = True
-                btr2.inputs.frac = 0.1
-                btr2.inputs.mask = True
-                btr2.inputs.out_file = os.path.join(output_dir, subject, 'ANTS_T1_r.nii.gz')
-                btr2.run()
+    return volume
 
-                # copy mask file to output folder
-                shutil.copy2(os.path.join(output_dir, subject, 'ANTS_T1_r_mask.nii.gz'),
-                             os.path.join(temp_dir, 'ANTS_T1_r_mask.nii.gz'))
 
-                # z score normalization
-                FLAIR_path = os.path.join(output_dir, subject, 'ANTS_T1_r.nii.gz')
-                FLAIR_final = nib.load(FLAIR_path)
-                FLAIR_mask_path = os.path.join(temp_dir, 'ANTS_T1_r_mask.nii.gz')
-                mask = nib.load(FLAIR_mask_path)
-                FLAIR_norm = zscore_normalize(FLAIR_final, mask)
-                nib.save(FLAIR_norm, FLAIR_path)
+def run_fsl_processing(image_path: Path, preprocessed_image_path: Path, ref: Path):
+    os.system(f'fslreorient2std {image_path} {preprocessed_image_path}')
+    os.system(f'robustfov -i {preprocessed_image_path} -r {preprocessed_image_path}')
+    os.system(f'bet {preprocessed_image_path} {preprocessed_image_path} -R')
+    os.system(f'flirt -in {preprocessed_image_path} -ref {ref} -out {preprocessed_image_path}')
+    # "fast" saves output file as {file_name}_restore.nii.gz
+    os.system(f'fast --nopve -B -o {preprocessed_image_path} {preprocessed_image_path}')
+    preprocessed_image_path_fsl = Path(str(preprocessed_image_path).replace(".nii", "_restore.nii"))
+    return preprocessed_image_path_fsl
 
-                print('.........................')
-                print('patient %s registration done' % subject)
+
+def load_np_image(preprocessed_image_path: Path) -> np.array:
+    ## load image
+    preprocessed_image_sitk = sitk.ReadImage(str(preprocessed_image_path))
+    preprocessed_image_np = sitk.GetArrayFromImage(preprocessed_image_sitk)
+    return preprocessed_image_np
+
+
+def cropping(image: np.array, axial_size: int = 90, central_crop_along_z: bool = True):
+    init_shape = image.shape
+    cropped_image = image
+    if axial_size is not None:
+        cropped_image = cropped_image[:,
+                        init_shape[1] // 2 - axial_size // 2:init_shape[1] // 2 + axial_size // 2,
+                        init_shape[2] // 2 - axial_size // 2:init_shape[2] // 2 + axial_size // 2]
+    if central_crop_along_z:
+        cropped_image = cropped_image[30:60, ...]
+
+    return cropped_image
+
+
+def save_np(image_np, preprocessed_image_path):
+    # preprocessed_image_path = preprocessed_image_path[:preprocessed_image_path.rfind(".")]
+    preprocessed_image_path = str(preprocessed_image_path).replace(".nii.gz", "")
+
+    data_dict = {"image": image_np}
+    np.savez_compressed(preprocessed_image_path, data_dict)  # saving into .npz
+
+
+def save_2d(image_np, preprocessed_image_path):
+    # preprocessed_image_path = str(preprocessed_image_path)[:str(preprocessed_image_path).rfind(".")]
+    new_preprocessed_image_path = str(preprocessed_image_path).replace(".nii.gz", "")
+    for slice in range(image_np.shape[0]):
+        Image.fromarray(image_np[slice]).save(new_preprocessed_image_path + f"_slice{slice}.tiff")
+
+
+def remove_nii_files(path: Path):
+    for file in path.parent.glob('**/*.nii*'):
+        file.unlink()
+
+
+def main():
+    total_start = time.time()
+
+    config = get_config_dict()
+
+    subject_folder_list = sorted(list(config["data_path"].glob('*')))
+    # subjects_list = [subject_folder.name for subject_folder in subject_folder_list]
+    nb_subjects = len(subject_folder_list)
+    nb_images = 0
+    for subject_nb, subject_folder in enumerate(subject_folder_list):
+        subject_image_files = sorted(subject_folder.glob("**/*.nii"))
+        subject_image_files_unique = get_unique_image_file(subject_image_files)
+
+        nb_images += subject_image_files_unique.shape[0]
+
+        for image_nb, image_path in enumerate(subject_image_files_unique):
+            preprocessed_image_path = Path(
+                str(image_path).replace("raw", "preprocessed").replace(".nii", ".nii.gz"))
+            preprocessed_image_path.parent.mkdir(parents=True, exist_ok=True)
+
+            nb_processed_files = len(list(preprocessed_image_path.parent.glob("**/*.tiff")))
+            if nb_processed_files > 0 and not config["re_process"]:
+                continue
+
+            start = time.time()
+            try:
+                preprocessed_image_path_fsl = run_fsl_processing(image_path, preprocessed_image_path,
+                                                                 config["reference_atlas_location"])
+                preprocessed_image_np = load_np_image(preprocessed_image_path_fsl)
+            except:
+                with open('load_error_list.txt', 'a') as the_file:
+                    the_file.write(f'{str(image_path)}\n')
+                continue
+
+            normalized_image_np = intensity_normalization(preprocessed_image_np)
+
+            if config["axial_size"] is not None:
+                cropped_normalized_image_np = cropping(normalized_image_np, axial_size=config["axial_size"])
+            if config["save_2d"]:
+                save_2d(cropped_normalized_image_np, preprocessed_image_path)
             else:
-                pass
-        else:
-            pass
+                save_np(cropped_normalized_image_np, preprocessed_image_path)
+
+            remove_nii_files(preprocessed_image_path)
+
+            print(
+                f' Subject {subject_nb}; Image {image_nb}, '
+                f'processing time: {datetime.timedelta(seconds=time.time() - start)}')
+            print(f" Subject {subject_folder.name}, image {preprocessed_image_path.parent.name}")
+
+    print(f'Total processing time: {datetime.timedelta(seconds=time.time() - total_start)}')
 
 
-def coregister(data_dir, subject, modality, output_dir):
-    print(subject)
-    with tempfile.TemporaryDirectory() as temp_dir:
-        # register with different modality
-        if modality == 'T2':
-            if not os.path.exists(os.path.join(output_dir, subject, 'ANTS_T2_r_final.nii.gz')):
-                if os.path.exists(os.path.join(data_dir, 'crossmoda_', subject, '_hrT2.nii.gz')) \
-                        and os.path.exists(os.path.join(output_dir, subject, 'ceT1_r_transform.matComposite.h5')):
-                    print('T2 coregistration starts...')
-                    reorient = fsl.utils.Reorient2Std()
-                    reorient.inputs.in_file = os.path.join(data_dir, 'crossmoda_', subject, '_hrT2.nii.gz')
-                    reorient.inputs.out_file = os.path.join(temp_dir, 'T2_reorient.nii.gz')
-                    reorient.run()
-
-                    # apply registration transformation on PWI
-                    at = ApplyTransforms()
-                    at.inputs.dimension = 3
-                    at.inputs.input_image_type = 3
-                    at.inputs.input_image = os.path.join(temp_dir, 'T2_reorient.nii.gz')
-                    at.inputs.reference_image = os.path.join(output_dir, subject, 'ANTS_T1_r.nii.gz')
-                    at.inputs.output_image = os.path.join(output_dir, subject, 'ANTS_T2_r.nii.gz')
-                    at.inputs.interpolation = 'Linear'
-                    at.inputs.default_value = 0
-                    at.inputs.transforms = os.path.join(output_dir, subject, 'ceT1_r_transform.matComposite.h5')
-                    at.run()
-
-                    # apply skull stripping mask
-                    am = fsl.maths.ApplyMask()
-                    am.inputs.in_file = os.path.join(output_dir, subject, 'ANTS_T2_r.nii.gz')
-                    am.inputs.mask_file = os.path.join(output_dir, subject, 'ANTS_T2_r_mask.nii.gz')
-                    am.inputs.out_file = os.path.join(output_dir, subject, 'ANTS_T2_r_final.nii.gz')
-                    am.run()
-                else:
-                    pass
-            else:
-                pass
-
-
-if __name__ == '__main__':
-    atlas_folder = "/data/haoyuezhang/data/vascular_territory_template"
-    data_folder = '/data/haoyuezhang/data/stroke_MRI/stroke_MRI/Original_nifti'
-    output_folder = '/data/haoyuezhang/data/stroke_MRI/stroke_perfusion'
-    reference_dir = '/data/haoyuezhang/data/stroke_MRI/stroke_MRI/Registered_output_histmatch/570244/'
-    in_histmatch_folder = '/data/haoyuezhang/data/stroke_MRI/stroke_MRI/Registered_output'
-    out_histmatch_folder = '/data/haoyuezhang/data/stroke_MRI/stroke_MRI/Registered_output_histmatch'
-
-    modality_list = ['T2']
-    modality_list_histmatch = ['T2']
-
-    parallel = False
-
-    def complete_reg_steps(p):
-        if not os.path.isdir(os.path.join(output_folder, p)):
-            os.makedirs(os.path.join(output_folder, p))
-
-        preprocess(data_folder, p, atlas_folder, output_folder)
-
-        for mo in modality_list:
-            coregister(data_folder, p, mo, output_folder)
-
-
-    if not parallel:
-        for patient in os.listdir(data_folder):
-
-            if not os.path.isdir(os.path.join(output_folder, patient)):
-                os.makedirs(os.path.join(output_folder, patient))
-
-            preprocess(data_folder, patient, atlas_folder, output_folder)
-
-            for m in modality_list:
-                coregister(data_folder, patient, m, output_folder)
-    else:
-        results = Parallel(n_jobs=8)(delayed(complete_reg_steps)(i) for i in os.listdir(data_folder))
+if __name__ == "__main__":
+    main()
